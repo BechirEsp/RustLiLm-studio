@@ -1,0 +1,96 @@
+name: Test, build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --no-default-features
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libvulkan-dev libssl-dev libclang-dev clang cmake pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-desktop
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item target/release/rustlilm-studio.exe dist/RustLiLm-Studio-windows-x64.exe
+      - name: Package Debian application
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb --locked
+          mkdir -p dist
+          cargo deb --no-build --output dist/rustlilm-studio-linux-amd64.deb
+          cp target/release/rustlilm-studio dist/rustlilm-studio-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [test, build]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Publish version after both native builds pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="v$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then version="$GITHUB_REF_NAME"; fi
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "Release $version already exists; bump Cargo.toml for a new release."
+            exit 0
+          fi
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          gh release create "$version" dist/* --target "$GITHUB_SHA" \
+            --title "RustLiLm Studio $version" --generate-notes \
+            --notes-file packaging/release-notes.md

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RustLiLm Studio
+Comment=Generate images and videos with your LiteLLM gateway
+Exec=rustlilm-studio
+Icon=applications-graphics
+Terminal=false
+Categories=Graphics;Video;
+StartupWMClass=rustlilm-studio

@@ -49,8 +49,9 @@ fn mock(steps: Vec<Step>) -> (String, thread::JoinHandle<()>) {
                 step.auth
             );
             if let Some(contains) = step.contains {
-                let mut body = String::new();
-                req.as_reader().read_to_string(&mut body).unwrap();
+                let mut bytes = Vec::new();
+                req.as_reader().read_to_end(&mut bytes).unwrap();
+                let body = String::from_utf8_lossy(&bytes);
                 assert!(
                     body.contains(contains),
                     "Request did not contain {contains}"
@@ -75,6 +76,7 @@ fn generation(dir: &std::path::Path) -> Generation {
         size: "1024x1024".into(),
         seconds: 4,
         destination: dir.into(),
+        input_image: None,
         logs: storage::metadata_dir(dir),
         prompt_id: Some(uuid::Uuid::new_v4()),
     }
@@ -175,8 +177,7 @@ fn base64_images_are_saved_with_metadata_and_gallery() {
     assert_eq!(std::fs::read(&assets[0].path).unwrap(), bytes);
     assert!(!assets[0].path.with_extension("json").exists());
     assert!(storage::metadata_dir(dir.path())
-        .join("assets")
-        .join(format!("{}.json", assets[0].id))
+        .join("studio.sqlite3")
         .exists());
     storage::save_gallery(dir.path(), &assets).unwrap();
     assert_eq!(
@@ -269,15 +270,25 @@ fn video_submission_checkpoint_polling_and_download() {
     let mut request = generation(dir.path());
     request.kind = MediaKind::Video;
     let pending = gateway.submit_video(&request).unwrap();
-    assert!(pending.checkpoint.exists());
-    assert!(pending
-        .checkpoint
-        .starts_with(storage::metadata_dir(dir.path()).join("jobs")));
+    assert_eq!(
+        rustlilm_studio::database::Database::workspace(&request.logs)
+            .unwrap()
+            .jobs()
+            .unwrap()
+            .len(),
+        1
+    );
     let asset = gateway
         .poll_video(&pending, Arc::new(AtomicBool::new(false)), |_| {})
         .unwrap();
     assert_eq!(std::fs::read(asset.path).unwrap(), video);
-    assert!(!pending.checkpoint.exists());
+    assert!(
+        rustlilm_studio::database::Database::workspace(&request.logs)
+            .unwrap()
+            .jobs()
+            .unwrap()
+            .is_empty()
+    );
     server.join().unwrap();
 }
 #[test]
@@ -289,10 +300,14 @@ fn cancelled_polling_preserves_checkpoint() {
     assert!(gateway
         .poll_video(&pending, Arc::new(AtomicBool::new(true)), |_| {})
         .is_err());
-    assert!(pending.checkpoint.exists());
-    assert!(pending
-        .checkpoint
-        .starts_with(storage::metadata_dir(dir.path()).join("jobs")));
+    assert_eq!(
+        rustlilm_studio::database::Database::workspace(&pending.request.logs)
+            .unwrap()
+            .jobs()
+            .unwrap()
+            .len(),
+        1
+    );
     server.join().unwrap();
 }
 #[test]
@@ -346,4 +361,233 @@ fn output_grouping_and_unique_names() {
     )
     .unwrap();
     assert_ne!(first.path, second.path);
+}
+
+#[test]
+fn edits_upload_reference_image_and_keep_original_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original.png");
+    let bytes = png();
+    std::fs::write(&original, &bytes).unwrap();
+    let mut post = step(
+        "POST",
+        "/v1/images/edits",
+        json!({"data":[{"b64_json":STANDARD.encode(&bytes)}]}),
+    );
+    post.contains = Some("name=\"image\"");
+    let (url, server) = mock(vec![post]);
+    let mut request = generation(dir.path());
+    request.input_image = Some(original.clone());
+    let assets = Gateway::new(&url, "test-key")
+        .unwrap()
+        .images(&request)
+        .unwrap();
+    assert_ne!(assets[0].path, original);
+    assert_eq!(std::fs::read(original).unwrap(), bytes);
+    assert_eq!(assets[0].prompt_id, request.prompt_id);
+    server.join().unwrap();
+}
+
+#[test]
+fn invalid_edit_reference_fails_before_sending_a_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.png");
+    std::fs::write(&path, b"not an image").unwrap();
+    let mut request = generation(dir.path());
+    request.input_image = Some(path);
+    let error = Gateway::new("http://127.0.0.1:1", "secret")
+        .unwrap()
+        .images(&request)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("decode"));
+}
+
+fn ollama_step(method: &'static str, path: &str, body: serde_json::Value) -> Step {
+    let mut s = step(method, path, body);
+    s.auth = None;
+    s
+}
+fn ollama_stream(path: &str, lines: &[serde_json::Value]) -> Step {
+    let mut s = ollama_step("POST", path, json!(null));
+    s.body = lines
+        .iter()
+        .map(|v| format!("{v}\n"))
+        .collect::<String>()
+        .into_bytes();
+    s
+}
+fn ollama(url: &str) -> Gateway {
+    Gateway::with_provider(url, "", storage::Provider::Ollama).unwrap()
+}
+
+#[test]
+fn ollama_discovery_combines_verified_catalog_with_installed_generation_models() {
+    let (url, server) = mock(vec![ollama_step(
+        "GET",
+        "/api/tags",
+        json!({"models":[
+        {"name":"x/z-image-turbo:latest","capabilities":["image"]},
+        {"name":"local-image:latest","capabilities":["image"]},
+        {"name":"vision-chat:latest","capabilities":["vision","completion"]}]}),
+    )]);
+    let models = ollama(&url).models().unwrap();
+    assert!(models
+        .iter()
+        .any(|m| m.id == "x/z-image-turbo:latest" && m.downloaded));
+    assert!(models
+        .iter()
+        .any(|m| m.id == "x/flux2-klein:latest" && !m.downloaded && m.source.is_some()));
+    assert!(models.iter().any(|m| m.id == "local-image:latest"));
+    assert!(!models.iter().any(|m| m.id.contains("vision-chat")));
+    assert!(!models
+        .iter()
+        .any(|m| m.supports(MediaKind::Video) || m.supports_operation(MediaKind::Image, true)));
+    server.join().unwrap();
+}
+
+#[test]
+fn ollama_pull_streams_progress_and_requires_success() {
+    let (url, server) = mock(vec![
+        ollama_step("GET", "/api/tags", json!({"models":[]})),
+        ollama_stream(
+            "/api/pull",
+            &[
+                json!({"status":"pulling manifest"}),
+                json!({"status":"pulling layer","completed":50,"total":100}),
+                json!({"status":"success"}),
+            ],
+        ),
+    ]);
+    let mut progress = Vec::new();
+    ollama(&url)
+        .pull_ollama("x/z-image-turbo", Arc::new(AtomicBool::new(false)), |s| {
+            progress.push(s)
+        })
+        .unwrap();
+    assert!(progress.iter().any(|s| s.contains("50.0%")));
+    server.join().unwrap();
+}
+
+#[test]
+fn ollama_does_not_download_an_installed_model() {
+    let (url, server) = mock(vec![ollama_step(
+        "GET",
+        "/api/tags",
+        json!({"models":[{"name":"x/z-image-turbo:latest"}]}),
+    )]);
+    ollama(&url)
+        .pull_ollama("x/z-image-turbo", Arc::new(AtomicBool::new(false)), |_| {})
+        .unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn ollama_incomplete_download_is_not_treated_as_installed() {
+    let (url, server) = mock(vec![
+        ollama_step("GET", "/api/tags", json!({"models":[]})),
+        ollama_stream(
+            "/api/pull",
+            &[json!({"status":"pulling layer","completed":50,"total":100})],
+        ),
+    ]);
+    let error = ollama(&url)
+        .pull_ollama("x/z-image-turbo", Arc::new(AtomicBool::new(false)), |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("before reporting success"));
+    server.join().unwrap();
+}
+
+#[test]
+fn ollama_stream_errors_do_not_expose_api_keys() {
+    let mut tags = ollama_step("GET", "/api/tags", json!({"models":[]}));
+    tags.auth = Some("Bearer test-key");
+    let mut stream = ollama_stream("/api/pull", &[json!({"error":"test-key was refused"})]);
+    stream.auth = Some("Bearer test-key");
+    let (url, server) = mock(vec![tags, stream]);
+    let error = Gateway::with_provider(&url, "test-key", storage::Provider::Ollama)
+        .unwrap()
+        .pull_ollama("x/z-image-turbo", Arc::new(AtomicBool::new(false)), |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("test-key"));
+    assert!(error.contains("redacted"));
+    server.join().unwrap();
+}
+
+#[test]
+fn ollama_native_image_stream_is_saved_and_progress_reported() {
+    let mut stream = ollama_stream(
+        "/api/generate",
+        &[
+            json!({"completed":1,"total":4,"done":false}),
+            json!({"image":STANDARD.encode(png()),"done":true}),
+        ],
+    );
+    stream.contains = Some("\"width\":1024");
+    let (url, server) = mock(vec![
+        ollama_step(
+            "GET",
+            "/api/tags",
+            json!({"models":[{"name":"my-image-alias:latest"}]}),
+        ),
+        stream,
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut progress = Vec::new();
+    let assets = ollama(&url)
+        .ollama_images(
+            &generation(dir.path()),
+            Arc::new(AtomicBool::new(false)),
+            |s| progress.push(s),
+        )
+        .unwrap();
+    assert_eq!(std::fs::read(&assets[0].path).unwrap(), png());
+    assert!(progress.iter().any(|s| s.contains("1/4")));
+    server.join().unwrap();
+}
+
+#[test]
+fn ollama_text_response_is_not_mistaken_for_an_image() {
+    let (url, server) = mock(vec![
+        ollama_step(
+            "GET",
+            "/api/tags",
+            json!({"models":[{"name":"my-image-alias:latest"}]}),
+        ),
+        ollama_stream(
+            "/api/generate",
+            &[json!({"response":"Here is an image description","done":true})],
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    assert!(ollama(&url)
+        .ollama_images(
+            &generation(dir.path()),
+            Arc::new(AtomicBool::new(false)),
+            |_| {}
+        )
+        .is_err());
+    server.join().unwrap();
+}
+
+#[test]
+fn ollama_video_and_editing_fail_locally_with_a_clear_explanation() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = ollama("http://127.0.0.1:1");
+    let mut request = generation(dir.path());
+    request.kind = MediaKind::Video;
+    assert!(client
+        .submit_video(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("video-generation"));
+    request.kind = MediaKind::Image;
+    request.input_image = Some(dir.path().join("reference.png"));
+    assert!(client
+        .ollama_images(&request, Arc::new(AtomicBool::new(false)), |_| {})
+        .unwrap_err()
+        .to_string()
+        .contains("image editing"));
 }

@@ -1,15 +1,15 @@
-RustLiLm Studio v0.2.0 adds a project-based workspace and in-app image viewing.
+RustLiLm Studio v0.3.0 adds image editing, Ollama integration, SQLite and remembered API keys.
 
-- Click an image to open it inside the app. Close it with Close or Escape.
-- Copy an image from the gallery or viewer and receive an Image copied toast.
-- Create/select projects in the left sidebar, with a project count and expandable prompt histories.
-- Select a previous prompt to restore its settings and view its outputs.
-- Use the bottom composer: prompt on the left; output type, model, size, and Generate on the right.
-- Open Settings over the studio. Save applies changes; Close, Cancel, and Escape discard unsaved edits and return home.
-- All JSON metadata and video job checkpoints now live in the shared `_studio` folder. Existing v0.1 metadata is migrated automatically; media files stay in place.
+- Edit a gallery image or upload a reference image, describe changes, and generate an edited copy through LiteLLM. Originals stay unchanged; history preserves references.
+- Choose LiteLLM or Ollama. Discover installed Ollama image generators plus a source-linked verified catalog; selecting a missing model starts downloading it with progress.
+- Store projects, prompt history, output indexes, video jobs and connection settings in SQLite. Existing JSON data is migrated automatically.
+- Remember API keys in Windows Credential Manager, macOS Keychain or Linux Secret Service, and restore them on later launches. Keys are not stored as ordinary SQLite records.
+- Resume video jobs from the in-app database list.
+
+Ollama limitation: upstream v0.32.6 temporarily removed experimental image generation; v0.32.5 on macOS is the documented supported release. Discovery and downloads do not guarantee the connected server supports generation. Image editing and videos require LiteLLM. No exhaustive supported remote image/video catalog API was found; the app bundles verified official models and discovers additional installed image-capable models.
 
 Windows: download and run `RustLiLm-Studio-windows-x64.exe`.
 Linux: install the amd64 `.deb` with `sudo apt install ./rustlilm-studio-linux-amd64.deb`.
-The Linux package targets Ubuntu 24.04 or newer compatible systems and requires a working Vulkan driver.
+Linux targets Ubuntu 24.04 or newer compatible systems, requires a working Vulkan driver, and needs an unlocked Secret Service for key persistence.
 
-Builds are unsigned. Gateway integration is tested with a local mock server; live provider generation requires your gateway credentials.
+Builds are unsigned. API workflows are tested with local mock servers; live provider generation requires your credentials/server.

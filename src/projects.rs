@@ -1,8 +1,8 @@
-use crate::storage::{metadata_dir, safe_component, write_json, Asset, MediaKind};
+use crate::storage::{metadata_dir, safe_component, Asset, MediaKind, Provider};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::path::Path;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -18,6 +18,10 @@ pub struct PromptEntry {
     pub detail: Option<String>,
     #[serde(default)]
     pub imported: bool,
+    #[serde(default)]
+    pub provider: Provider,
+    #[serde(default)]
+    pub input_image: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,12 +45,8 @@ pub struct ProjectBook {
 
 impl ProjectBook {
     pub fn load(root: &Path, gallery: &[Asset]) -> Result<Self> {
-        let path = metadata_dir(root).join("projects.json");
-        let mut book: Self = if path.exists() {
-            serde_json::from_slice(&fs::read(path)?)?
-        } else {
-            Self::default()
-        };
+        crate::storage::migrate_legacy(root)?;
+        let mut book = crate::database::Database::workspace(&metadata_dir(root))?.projects()?;
         book.import_assets(gallery);
         book.save(root)?;
         Ok(book)
@@ -97,6 +97,8 @@ impl ProjectBook {
                         state: PromptState::Completed,
                         detail: None,
                         imported: true,
+                        provider: Provider::LiteLlm,
+                        input_image: None,
                     },
                 );
             }
@@ -104,7 +106,7 @@ impl ProjectBook {
     }
 
     pub fn save(&self, root: &Path) -> Result<()> {
-        write_json(&metadata_dir(root).join("projects.json"), self)
+        crate::database::Database::workspace(&metadata_dir(root))?.save_projects(self)
     }
 
     pub fn create(&mut self, name: &str) -> Result<Uuid> {

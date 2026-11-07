@@ -1,0 +1,15 @@
+{
+  "checked": "2026-11-07",
+  "notes": "Verified experimental Ollama image models, not an exhaustive registry. Current upstream releases temporarily disable image generation. No supported video-generation endpoint exists.",
+  "sources": [
+    "https://ollama.com/blog/image-generation",
+    "https://ollama.com/x/z-image-turbo",
+    "https://ollama.com/x/flux2-klein",
+    "https://github.com/ollama/ollama/releases/tag/v0.32.6"
+  ],
+  "models": [
+    { "id": "x/z-image-turbo:latest", "source": "https://ollama.com/x/z-image-turbo" },
+    { "id": "x/flux2-klein:latest", "source": "https://ollama.com/x/flux2-klein" },
+    { "id": "x/flux2-klein:9b", "source": "https://ollama.com/x/flux2-klein" }
+  ]
+}

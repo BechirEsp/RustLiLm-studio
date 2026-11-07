@@ -1,4 +1,4 @@
-use crate::storage::{save_asset, write_json, Asset, AssetDetails, MediaKind};
+use crate::storage::{save_asset, Asset, AssetDetails, MediaKind, Provider};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{
@@ -25,25 +25,37 @@ const MAX_VIDEO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Gateway {
     base: Url,
+    provider: Provider,
     key: String,
-    client: Client,
+    pub(crate) client: Client,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub id: String,
     pub mode: Option<String>,
+    pub downloaded: bool,
+    pub supports_edit: Option<bool>,
+    pub source: Option<String>,
 }
 
 impl Model {
     pub fn supports(&self, kind: MediaKind) -> bool {
         match self.mode.as_deref() {
-            Some("image_generation") => kind == MediaKind::Image,
+            Some("image_generation" | "image_edit") => kind == MediaKind::Image,
             Some("video_generation") => kind == MediaKind::Video,
             // Plain /models often lacks capabilities; keep unknown aliases usable.
             None => true,
             Some(_) => false,
         }
+    }
+    pub fn supports_operation(&self, kind: MediaKind, editing: bool) -> bool {
+        self.supports(kind)
+            && if editing {
+                self.supports_edit != Some(false)
+            } else {
+                self.mode.as_deref() != Some("image_edit")
+            }
     }
 }
 
@@ -60,6 +72,8 @@ pub struct Generation {
     pub logs: PathBuf,
     #[serde(default)]
     pub prompt_id: Option<Uuid>,
+    #[serde(default)]
+    pub input_image: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,6 +86,19 @@ pub struct PendingVideo {
 
 impl Gateway {
     pub fn new(base: &str, key: &str) -> Result<Self> {
+        Self::with_provider(base, key, Provider::LiteLlm)
+    }
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+    pub(crate) fn redacted(&self, value: &str) -> String {
+        if self.key.is_empty() {
+            value.into()
+        } else {
+            value.replace(&self.key, "[redacted]")
+        }
+    }
+    pub fn with_provider(base: &str, key: &str, provider: Provider) -> Result<Self> {
         let mut base = Url::parse(base.trim())
             .context("Enter a complete gateway URL, e.g. http://localhost:4000")?;
         if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
@@ -85,6 +112,11 @@ impl Gateway {
             bail!("Put your key in the API key field; the URL must not contain credentials, a query, or a fragment");
         }
         let path = base.path().trim_end_matches('/').to_string();
+        let path = if provider == Provider::Ollama {
+            path.strip_suffix("/api").unwrap_or(&path).to_string()
+        } else {
+            path
+        };
         base.set_path(&format!("{}/", path.strip_suffix("/v1").unwrap_or(&path)));
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -94,6 +126,7 @@ impl Gateway {
             .build()?;
         Ok(Self {
             base,
+            provider,
             key: key.trim().into(),
             client,
         })
@@ -103,7 +136,7 @@ impl Gateway {
         Ok(self.base.join(path)?)
     }
 
-    fn auth(&self, request: RequestBuilder) -> RequestBuilder {
+    pub(crate) fn auth(&self, request: RequestBuilder) -> RequestBuilder {
         if self.key.is_empty() {
             request
         } else {
@@ -111,7 +144,7 @@ impl Gateway {
         }
     }
 
-    fn checked(&self, response: Response) -> Result<Response> {
+    pub(crate) fn checked(&self, response: Response) -> Result<Response> {
         if response.status().is_success() {
             return Ok(response);
         }
@@ -125,6 +158,9 @@ impl Gateway {
     }
 
     pub fn models(&self) -> Result<Vec<Model>> {
+        if self.provider == Provider::Ollama {
+            return self.ollama_models();
+        }
         let response: Value = self
             .checked(
                 self.auth(self.client.get(self.endpoint("v1/models")?))
@@ -139,6 +175,9 @@ impl Gateway {
             .filter_map(|m| {
                 Some(Model {
                     id: m["id"].as_str()?.into(),
+                    downloaded: true,
+                    supports_edit: None,
+                    source: None,
                     mode: m
                         .pointer("/model_info/mode")
                         .or_else(|| m.get("mode"))
@@ -184,8 +223,29 @@ impl Gateway {
     }
 
     pub fn images(&self, request: &Generation) -> Result<Vec<Asset>> {
-        let response: Value = self.checked(self.auth(self.client.post(self.endpoint("v1/images/generations")?))
-            .json(&json!({ "model": request.model, "prompt": request.prompt, "n": 1, "size": request.size })).send()?)?.json()?;
+        if self.provider == Provider::Ollama {
+            return self.ollama_images(request, Arc::new(AtomicBool::new(false)), |_| {});
+        }
+        let response = if let Some(path) = &request.input_image {
+            let bytes = read_edit_image(path)?;
+            let form = multipart::Form::new()
+                .text("model", request.model.clone())
+                .text("prompt", request.prompt.clone())
+                .text("size", request.size.clone())
+                .part(
+                    "image",
+                    multipart::Part::bytes(bytes)
+                        .file_name("reference.png")
+                        .mime_str("image/png")?,
+                );
+            self.auth(self.client.post(self.endpoint("v1/images/edits")?))
+                .multipart(form)
+                .send()?
+        } else {
+            self.auth(self.client.post(self.endpoint("v1/images/generations")?))
+                .json(&json!({"model": request.model, "prompt": request.prompt, "n": 1, "size": request.size})).send()?
+        };
+        let response: Value = self.checked(response)?.json()?;
         let data = response["data"]
             .as_array()
             .context("Image response has no data array")?;
@@ -206,28 +266,7 @@ impl Gateway {
             } else {
                 bail!("Image result has neither b64_json nor url");
             };
-            let format =
-                image::guess_format(&bytes).context("Gateway did not return a supported image")?;
-            let extension = match format {
-                image::ImageFormat::Png => "png",
-                image::ImageFormat::Jpeg => "jpg",
-                image::ImageFormat::WebP => "webp",
-                image::ImageFormat::Gif => "gif",
-                _ => bail!("Unsupported image format: {format:?}"),
-            };
-            assets.push(save_asset(
-                &request.destination,
-                &request.logs,
-                &bytes,
-                extension,
-                AssetDetails {
-                    kind: MediaKind::Image,
-                    model: &request.model,
-                    prompt: &request.prompt,
-                    project: &request.project,
-                    prompt_id: request.prompt_id,
-                },
-            )?);
+            assets.push(save_image_bytes(&bytes, request)?);
         }
         Ok(assets)
     }
@@ -248,6 +287,11 @@ impl Gateway {
     }
 
     pub fn submit_video(&self, request: &Generation) -> Result<PendingVideo> {
+        if self.provider == Provider::Ollama {
+            bail!(
+                "Ollama does not expose a supported video-generation API. Use LiteLLM for video."
+            );
+        }
         let form = multipart::Form::new()
             .text("model", request.model.clone())
             .text("prompt", request.prompt.clone())
@@ -266,13 +310,10 @@ impl Gateway {
                 .context("Video response has no job ID")?
                 .into(),
             request: request.clone(),
-            checkpoint: request.logs.join("jobs").join(format!(
-                "{}.json",
-                request.prompt_id.unwrap_or_else(Uuid::new_v4)
-            )),
+            checkpoint: PathBuf::new(),
         };
         // Keep the job ID before polling. A timeout or restart must not submit (and bill) it again.
-        write_json(&pending.checkpoint, &pending)?;
+        crate::database::Database::workspace(&request.logs)?.save_job(&pending)?;
         Ok(pending)
     }
 
@@ -329,7 +370,7 @@ impl Gateway {
                             prompt_id: r.prompt_id,
                         },
                     )?;
-                    let _ = std::fs::remove_file(&pending.checkpoint);
+                    crate::database::Database::workspace(&r.logs)?.remove_job(&pending.id)?;
                     return Ok(asset);
                 }
                 "failed" | "cancelled" | "canceled" => {
@@ -367,4 +408,46 @@ fn read_limited(response: Response, max: u64) -> Result<Vec<u8>> {
         bail!("Media file exceeds download limit");
     }
     Ok(bytes)
+}
+
+pub(crate) fn save_image_bytes(bytes: &[u8], request: &Generation) -> Result<Asset> {
+    let format =
+        image::guess_format(bytes).context("The server did not return a supported image")?;
+    let extension = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::WebP => "webp",
+        image::ImageFormat::Gif => "gif",
+        _ => bail!("Unsupported image format: {format:?}"),
+    };
+    save_asset(
+        &request.destination,
+        &request.logs,
+        bytes,
+        extension,
+        AssetDetails {
+            kind: MediaKind::Image,
+            model: &request.model,
+            prompt: &request.prompt,
+            project: &request.project,
+            prompt_id: request.prompt_id,
+        },
+    )
+}
+
+fn read_edit_image(path: &std::path::Path) -> Result<Vec<u8>> {
+    if std::fs::metadata(path)?.len() > MAX_IMAGE_BYTES {
+        bail!("Input image exceeds 100 MiB");
+    }
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().context("Cannot decode the image to edit")?;
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png)?;
+    if bytes.get_ref().len() as u64 > MAX_IMAGE_BYTES {
+        bail!("Converted input image exceeds 100 MiB");
+    }
+    Ok(bytes.into_inner())
 }

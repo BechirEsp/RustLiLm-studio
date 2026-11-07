@@ -5,13 +5,13 @@ use gpui_component::{
     button::*,
     checkbox::Checkbox,
     input::{Input, InputState},
-    select::{Select, SelectState},
+    select::{Select, SelectEvent, SelectItem, SelectState},
     Disableable, IndexPath, Root, Theme, ThemeMode,
 };
 use rustlilm_studio::{
     gateway::{Gateway, Generation, Model, PendingVideo},
     projects::{ProjectBook, PromptEntry, PromptState},
-    storage::{self, Asset, MediaKind, Settings},
+    storage::{self, Asset, MediaKind, Provider, Settings},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -31,6 +31,11 @@ enum Event {
     Progress(String),
     Finished(Option<Uuid>, Result<Vec<Asset>, String>),
     Clipboard(Result<Vec<u8>, String>),
+    Reference(Option<Result<PathBuf, String>>),
+    Pull(u64, String, Result<(), String>),
+    PullProgress(u64, String),
+    Credential(Provider, String, Result<Option<String>, String>),
+    CredentialSaved(Provider, String, Result<(), String>),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -41,6 +46,25 @@ enum Page {
 struct Toast {
     message: String,
     expires: Instant,
+}
+
+#[derive(Clone)]
+struct ModelChoice {
+    id: String,
+    downloaded: Option<bool>,
+}
+impl SelectItem for ModelChoice {
+    type Value = String;
+    fn title(&self) -> SharedString {
+        match self.downloaded {
+            Some(true) => format!("{} · Installed", self.id).into(),
+            Some(false) => format!("{} · Download", self.id).into(),
+            None => self.id.clone().into(),
+        }
+    }
+    fn value(&self) -> &String {
+        &self.id
+    }
 }
 
 struct Studio {
@@ -58,7 +82,15 @@ struct Studio {
     new_project: Entity<InputState>,
     prompt: Entity<InputState>,
     models: Vec<Model>,
-    model: Entity<SelectState<Vec<String>>>,
+    model: Entity<SelectState<Vec<ModelChoice>>>,
+    _model_subscription: Subscription,
+    input_image: Option<PathBuf>,
+    jobs_open: bool,
+    pending_jobs: Vec<PendingVideo>,
+    reference_loading: bool,
+    pulling: Option<String>,
+    pull_epoch: u64,
+    pull_cancel: Arc<AtomicBool>,
     size: Entity<SelectState<Vec<String>>>,
     seconds: Entity<SelectState<Vec<String>>>,
     kind: MediaKind,
@@ -105,12 +137,23 @@ impl Studio {
                 true,
             ),
         };
-        let connected_key = std::env::var("LITELLM_API_KEY").unwrap_or_default();
+        let connected_key = provider_key(settings.provider);
         let (tx, rx) = mpsc::channel();
+        let model = cx.new(|cx| {
+            SelectState::new(Vec::<ModelChoice>::new(), None, window, cx).searchable(true)
+        });
+        let model_subscription = cx.subscribe(
+            &model,
+            |this, _, event: &SelectEvent<Vec<ModelChoice>>, cx| {
+                if let SelectEvent::Confirm(Some(model)) = event {
+                    this.download_model(model.clone(), cx);
+                }
+            },
+        );
         let this = Self {
             url: input(
-                settings.gateway_url.clone(),
-                "https://your-gateway.example.com",
+                settings.endpoint_url().to_string(),
+                "http://localhost:4000 or http://localhost:11434",
                 window,
                 cx,
             ),
@@ -134,9 +177,15 @@ impl Studio {
                     .rows(7)
                     .placeholder("Describe the scene, composition, lighting, and mood…")
             }),
-            model: cx.new(|cx| {
-                SelectState::new(Vec::<String>::new(), None, window, cx).searchable(true)
-            }),
+            model,
+            _model_subscription: model_subscription,
+            input_image: None,
+            jobs_open: false,
+            pending_jobs: Vec::new(),
+            reference_loading: false,
+            pulling: None,
+            pull_epoch: 0,
+            pull_cancel: Arc::new(AtomicBool::new(false)),
             size: cx.new(|cx| SelectState::new(image_sizes(), Some(IndexPath::new(0)), window, cx)),
             seconds: cx.new(|cx| {
                 SelectState::new(
@@ -187,6 +236,7 @@ impl Studio {
             }
         })
         .detach();
+        this.load_stored_key();
         this
     }
 
@@ -229,6 +279,19 @@ impl Studio {
                             self.status =
                                 format!("Connected · {} models available", self.models.len());
                             self.error = false;
+                            self.settings.provider = self.gateway.as_ref().unwrap().provider();
+                            self.settings.remember_key = self.draft_settings.remember_key;
+                            if self.settings.provider == Provider::Ollama {
+                                self.settings.ollama_url = self.url.read(cx).value().trim().into();
+                            } else {
+                                self.settings.gateway_url = self.url.read(cx).value().trim().into();
+                            }
+                            if let Err(error) = self.settings.save() {
+                                self.fail(format!(
+                                    "Cannot remember the connection settings: {error}"
+                                ));
+                            }
+                            self.persist_connection_key();
                         }
                         Err(e) => {
                             self.pending_settings = None;
@@ -281,6 +344,72 @@ impl Studio {
                         self.fail(format!("Could not save prompt history: {e}"));
                     }
                 }
+                Event::Credential(provider, url, result) => {
+                    if self.draft_settings.provider == provider
+                        && self.url.read(cx).value().trim() == url
+                        && self.key.read(cx).value().is_empty()
+                    {
+                        match result {
+                            Ok(Some(key)) => self
+                                .key
+                                .update(cx, |input, cx| input.set_value(key, window, cx)),
+                            Ok(None) => {}
+                            Err(error) => self.fail(error),
+                        }
+                    }
+                }
+                Event::CredentialSaved(provider, url, result) => {
+                    if provider != self.settings.provider || url != self.settings.endpoint_url() {
+                        continue;
+                    }
+                    if let Err(error) = result {
+                        self.fail(format!(
+                            "Connected, but the API key was not remembered: {error}"
+                        ));
+                    }
+                }
+                Event::Reference(result) => {
+                    self.reference_loading = false;
+                    match result {
+                        Some(Ok(path)) => {
+                            self.input_image = Some(path);
+                            self.set_kind(MediaKind::Image, window, cx);
+                            self.status =
+                                "Reference image ready. Describe the changes and click Edit image."
+                                    .into();
+                            self.error = false;
+                        }
+                        Some(Err(error)) => self.fail(error),
+                        None => {}
+                    }
+                }
+                Event::PullProgress(epoch, message) => {
+                    if epoch == self.pull_epoch {
+                        self.status = message;
+                    }
+                }
+                Event::Pull(epoch, model, result) => {
+                    if epoch != self.pull_epoch {
+                        continue;
+                    }
+                    self.pulling = None;
+                    match result {
+                        Ok(()) => {
+                            for item in &mut self.models {
+                                if rustlilm_studio::ollama::canonical_model(&item.id)
+                                    == rustlilm_studio::ollama::canonical_model(&model)
+                                {
+                                    item.downloaded = true;
+                                }
+                            }
+                            self.update_models(window, cx);
+                            self.show_toast("Model downloaded");
+                            self.status = "Model is ready.".into();
+                            self.error = false;
+                        }
+                        Err(error) => self.fail(error),
+                    }
+                }
                 Event::Clipboard(result) => match result {
                     Ok(bytes) => {
                         cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
@@ -312,13 +441,17 @@ impl Studio {
         if self.connecting {
             return;
         }
-        match Gateway::new(&self.url.read(cx).value(), &self.key.read(cx).value()) {
+        match Gateway::with_provider(
+            &self.url.read(cx).value(),
+            &self.key.read(cx).value(),
+            self.draft_settings.provider,
+        ) {
             Ok(gateway) => {
                 self.connect_epoch += 1;
                 let epoch = self.connect_epoch;
                 self.connecting = true;
                 self.error = false;
-                self.status = "Fetching gateway models…".into();
+                self.status = "Discovering available models…".into();
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     let result = gateway.models().map_err(|e| e.to_string());
@@ -335,13 +468,26 @@ impl Studio {
         let items = self
             .models
             .iter()
-            .filter(|m| m.supports(self.kind))
-            .map(|m| m.id.clone())
+            .filter(|m| m.supports_operation(self.kind, self.input_image.is_some()))
+            .map(|m| ModelChoice {
+                id: m.id.clone(),
+                downloaded: if self.active_provider() == Provider::Ollama {
+                    Some(m.downloaded)
+                } else {
+                    None
+                },
+            })
             .collect::<Vec<_>>();
         let index = previous
             .as_ref()
-            .and_then(|id| items.iter().position(|m| m == id))
-            .or(if items.is_empty() { None } else { Some(0) })
+            .and_then(|id| items.iter().position(|m| &m.id == id))
+            .or(
+                if items.is_empty() || self.active_provider() == Provider::Ollama {
+                    None
+                } else {
+                    Some(0)
+                },
+            )
             .map(IndexPath::new);
         self.model.update(cx, |select, cx| {
             select.set_items(items, window, cx);
@@ -350,6 +496,9 @@ impl Studio {
     }
     fn set_kind(&mut self, kind: MediaKind, window: &mut Window, cx: &mut Context<Self>) {
         self.kind = kind;
+        if kind == MediaKind::Video {
+            self.input_image = None;
+        }
         self.update_models(window, cx);
         self.size.update(cx, |select, cx| {
             select.set_items(
@@ -381,7 +530,11 @@ impl Studio {
     }
     fn candidate_settings(&self, cx: &App) -> anyhow::Result<Settings> {
         let mut settings = self.draft_settings.clone();
-        settings.gateway_url = self.url.read(cx).value().trim().into();
+        if settings.provider == Provider::Ollama {
+            settings.ollama_url = self.url.read(cx).value().trim().into();
+        } else {
+            settings.gateway_url = self.url.read(cx).value().trim().into();
+        }
         let value = self.folder.read(cx).value();
         if value.trim().is_empty() {
             anyhow::bail!("Choose an output folder");
@@ -433,7 +586,7 @@ impl Studio {
     }
     fn reset_settings_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.url.update(cx, |i, cx| {
-            i.set_value(self.settings.gateway_url.clone(), window, cx)
+            i.set_value(self.settings.endpoint_url().to_string(), window, cx)
         });
         self.folder.update(cx, |i, cx| {
             i.set_value(
@@ -470,7 +623,8 @@ impl Studio {
                 return;
             }
         };
-        if settings.gateway_url == self.settings.gateway_url
+        if settings.provider == self.settings.provider
+            && settings.endpoint_url() == self.settings.endpoint_url()
             && self.key.read(cx).value().as_ref() == self.connected_key
         {
             match self.apply_workspace(settings) {
@@ -479,6 +633,7 @@ impl Studio {
                     self.show_toast("Settings saved");
                     self.status = "Ready to create.".into();
                     self.error = false;
+                    self.persist_connection_key();
                 }
                 Err(e) => self.fail(e.to_string()),
             }
@@ -507,6 +662,8 @@ impl Studio {
         }
         self.selected_project = Some(id);
         self.selected_prompt = None;
+        self.input_image = None;
+        self.update_models(window, cx);
         let text = self.drafts.get(&id).cloned().unwrap_or_default();
         self.prompt
             .update(cx, |i, cx| i.set_value(text, window, cx));
@@ -547,6 +704,7 @@ impl Studio {
         self.selected_prompt = Some(id);
         self.prompt
             .update(cx, |i, cx| i.set_value(entry.text, window, cx));
+        self.input_image = entry.input_image.clone();
         self.set_kind(entry.kind, window, cx);
         self.model
             .update(cx, |s, cx| s.set_selected_value(&entry.model, window, cx));
@@ -555,7 +713,11 @@ impl Studio {
         self.seconds.update(cx, |s, cx| {
             s.set_selected_value(&entry.seconds.to_string(), window, cx)
         });
-        if self.model.read(cx).selected_value().is_none() {
+        if entry.provider != self.active_provider() {
+            self.model
+                .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+            self.fail(format!("This prompt used {}. Connect to it in Settings, or choose a model from the current provider.", entry.provider.label()));
+        } else if self.model.read(cx).selected_value().is_none() {
             self.fail(
                 "This prompt's model is unavailable. Choose a model before generating.".into(),
             );
@@ -563,10 +725,15 @@ impl Studio {
             self.status = "Prompt restored. You can edit and generate again.".into();
             self.error = false;
         }
+        if entry.provider == self.active_provider() {
+            if let Some(model) = self.model.read(cx).selected_value().cloned() {
+                self.download_model(model, cx);
+            }
+        }
         cx.notify();
     }
     fn generate(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.pulling.is_some() || self.reference_loading {
             return;
         }
         let Some(gateway) = self.gateway.clone() else {
@@ -605,6 +772,11 @@ impl Studio {
                 .selected_value()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4);
+            if gateway.provider() == Provider::Ollama
+                && (self.kind == MediaKind::Video || self.input_image.is_some())
+            {
+                anyhow::bail!("Use LiteLLM for image editing or video. Ollama currently supports only experimental image generation on compatible servers.");
+            }
             let id = Uuid::new_v4();
             let request = Generation {
                 model: model.clone(),
@@ -616,6 +788,7 @@ impl Studio {
                 seconds,
                 logs: storage::metadata_dir(&self.settings.output),
                 prompt_id: Some(id),
+                input_image: self.input_image.clone(),
             };
             let mut candidate = self.book.clone();
             candidate.add_prompt(
@@ -631,6 +804,8 @@ impl Studio {
                     state: PromptState::Submitted,
                     detail: None,
                     imported: false,
+                    provider: gateway.provider(),
+                    input_image: self.input_image.clone(),
                 },
             )?;
             candidate.save(&self.settings.output)?;
@@ -646,7 +821,13 @@ impl Studio {
                 std::thread::spawn(move || {
                     let result = (|| -> anyhow::Result<Vec<Asset>> {
                         if request.kind == MediaKind::Image {
-                            gateway.images(&request)
+                            if gateway.provider() == Provider::Ollama {
+                                gateway.ollama_images(&request, cancel, |s| {
+                                    let _ = tx.send(Event::Progress(s));
+                                })
+                            } else {
+                                gateway.images(&request)
+                            }
                         } else {
                             let pending = gateway.submit_video(&request)?;
                             gateway
@@ -674,42 +855,49 @@ impl Studio {
         self.cancel = Arc::new(AtomicBool::new(false));
     }
     fn resume(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.pulling.is_some() {
             return;
         }
+        if self.active_provider() == Provider::Ollama {
+            self.fail("Use the LiteLLM gateway that created the video job.".into());
+            cx.notify();
+            return;
+        }
+        match rustlilm_studio::database::Database::workspace(&storage::metadata_dir(
+            &self.settings.output,
+        ))
+        .and_then(|db| db.jobs())
+        {
+            Ok(jobs) => {
+                self.pending_jobs = jobs;
+                self.jobs_open = true;
+            }
+            Err(error) => self.fail(error.to_string()),
+        }
+        cx.notify();
+    }
+    fn resume_job(&mut self, pending: PendingVideo, cx: &mut Context<Self>) {
         let Some(gateway) = self.gateway.clone() else {
             return;
         };
-        let tx = self.tx.clone();
-        let logs = storage::metadata_dir(&self.settings.output);
+        self.jobs_open = false;
         self.start_job(MediaKind::Video);
+        let tx = self.tx.clone();
         let cancel = self.cancel.clone();
         std::thread::spawn(move || {
-            let mut prompt_id = None;
-            let result = (|| -> anyhow::Result<Vec<Asset>> {
-                let path = rfd::FileDialog::new()
-                    .set_title("Resume a saved video job")
-                    .set_directory(logs.join("jobs"))
-                    .add_filter("Video jobs", &["json"])
-                    .pick_file()
-                    .ok_or_else(|| anyhow::anyhow!("Resume cancelled"))?;
-                let mut pending: PendingVideo = serde_json::from_slice(&std::fs::read(&path)?)?;
-                pending.checkpoint = path;
-                pending.request.logs = logs;
-                prompt_id = pending.request.prompt_id;
-                gateway
-                    .poll_video(&pending, cancel, |s| {
-                        let _ = tx.send(Event::Progress(s));
-                    })
-                    .map(|a| vec![a])
-            })();
+            let result = gateway
+                .poll_video(&pending, cancel, |s| {
+                    let _ = tx.send(Event::Progress(s));
+                })
+                .map(|a| vec![a]);
             let _ = tx.send(Event::Finished(
-                prompt_id,
+                pending.request.prompt_id,
                 result.map_err(|e| e.to_string()),
             ));
         });
         cx.notify();
     }
+
     fn copy(&mut self, path: PathBuf) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -727,6 +915,213 @@ impl Studio {
         });
     }
 
+    fn active_provider(&self) -> Provider {
+        self.gateway
+            .as_ref()
+            .map(Gateway::provider)
+            .unwrap_or(self.settings.provider)
+    }
+    fn load_stored_key(&self) {
+        if !self.draft_settings.remember_key {
+            return;
+        }
+        let provider = self.draft_settings.provider;
+        let url = self.draft_settings.endpoint_url().to_string();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                rustlilm_studio::credentials::load(provider, &url).map_err(|e| e.to_string());
+            let _ = tx.send(Event::Credential(provider, url, result));
+        });
+    }
+    fn persist_connection_key(&self) {
+        let provider = self.settings.provider;
+        let url = self.settings.endpoint_url().to_string();
+        let key = if self.settings.remember_key {
+            Some(self.connected_key.clone())
+        } else {
+            None
+        };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = rustlilm_studio::credentials::save(provider, &url, key.as_deref())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Event::CredentialSaved(provider, url, result));
+        });
+    }
+    fn choose_provider(&mut self, provider: Provider, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connecting {
+            return;
+        }
+        if self.draft_settings.provider == Provider::Ollama {
+            self.draft_settings.ollama_url = self.url.read(cx).value().to_string();
+        } else {
+            self.draft_settings.gateway_url = self.url.read(cx).value().to_string();
+        }
+        self.draft_settings.provider = provider;
+        self.url.update(cx, |input, cx| {
+            input.set_value(self.draft_settings.endpoint_url().to_string(), window, cx)
+        });
+        let key = if provider == self.settings.provider {
+            self.connected_key.clone()
+        } else {
+            provider_key(provider)
+        };
+        self.key
+            .update(cx, |input, cx| input.set_value(key, window, cx));
+        self.load_stored_key();
+        cx.notify();
+    }
+    fn download_model(&mut self, model: String, cx: &mut Context<Self>) {
+        if self.busy || self.pulling.is_some() || self.active_provider() != Provider::Ollama {
+            return;
+        }
+        if !self.models.iter().any(|m| m.id == model && !m.downloaded) {
+            return;
+        }
+        let Some(gateway) = self.gateway.clone() else {
+            return;
+        };
+        self.pull_epoch += 1;
+        let epoch = self.pull_epoch;
+        self.pulling = Some(model.clone());
+        self.pull_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.pull_cancel.clone();
+        self.status = format!("Downloading {model} to the connected Ollama server…");
+        self.error = false;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = gateway.pull_ollama(&model, cancel, |s| {
+                let _ = tx.send(Event::PullProgress(epoch, s));
+            });
+            let _ = tx.send(Event::Pull(epoch, model, result.map_err(|e| e.to_string())));
+        });
+        cx.notify();
+    }
+    fn upload_reference(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.reference_loading {
+            return;
+        }
+        self.reference_loading = true;
+        let logs = storage::metadata_dir(&self.settings.output);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = rfd::FileDialog::new()
+                .set_title("Choose an image to edit")
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+                .pick_file()
+                .map(|path| storage::prepare_reference(&path, &logs).map_err(|e| e.to_string()));
+            let _ = tx.send(Event::Reference(result));
+        });
+        cx.notify();
+    }
+    fn begin_edit(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.reference_loading || self.pulling.is_some() {
+            return;
+        }
+        self.viewer = None;
+        self.selected_prompt = None;
+        self.input_image = None;
+        self.reference_loading = true;
+        self.prompt.update(cx, |i, cx| i.set_value("", window, cx));
+        self.set_kind(MediaKind::Image, window, cx);
+        let logs = storage::metadata_dir(&self.settings.output);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = storage::prepare_reference(&path, &logs).map_err(|e| e.to_string());
+            let _ = tx.send(Event::Reference(Some(result)));
+        });
+        cx.notify();
+    }
+    fn clear_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input_image = None;
+        self.update_models(window, cx);
+        cx.notify();
+    }
+    fn connection_fields(&self, cx: &mut Context<Self>) -> AnyElement {
+        div().flex().flex_col().gap_3().child(label("Provider"))
+            .child(div().flex().gap_2()
+                .child(Button::new("provider-litellm").label("LiteLLM").when(self.draft_settings.provider == Provider::LiteLlm, |b| b.primary()).disabled(self.connecting)
+                    .on_click(cx.listener(|this, _, w, cx| this.choose_provider(Provider::LiteLlm, w, cx))))
+                .child(Button::new("provider-ollama").label("Ollama").when(self.draft_settings.provider == Provider::Ollama, |b| b.primary()).disabled(self.connecting)
+                    .on_click(cx.listener(|this, _, w, cx| this.choose_provider(Provider::Ollama, w, cx)))))
+            .child(label("Server URL")).child(Input::new(&self.url).disabled(self.connecting))
+            .child(label("API key (optional for local Ollama)")).child(Input::new(&self.key).disabled(self.connecting))
+            .child(Checkbox::new("remember-key").label("Remember API key in the OS credential store").checked(self.draft_settings.remember_key).disabled(self.connecting)
+                .on_click(cx.listener(|this, value, _, cx| { this.draft_settings.remember_key = *value; cx.notify(); })))
+            .when(self.draft_settings.provider == Provider::Ollama, |col| col.child(div().text_xs().text_color(rgb(0xf0cf91))
+                .child("Ollama's image API is experimental (documented on macOS v0.32.5; removed upstream in v0.32.6). Editing/video require LiteLLM. Selecting a missing model downloads it to this server; files can be several GB.")))
+            .into_any_element()
+    }
+    fn jobs_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x080b14ee))
+            .p_8()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .id("video-jobs")
+                    .w(px(650.))
+                    .max_h_full()
+                    .overflow_y_scroll()
+                    .p_5()
+                    .rounded_xl()
+                    .bg(rgb(0x1b2130))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(label("Saved video jobs"))
+                            .child(Button::new("close-jobs").label("Close ×").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.jobs_open = false;
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .when(self.pending_jobs.is_empty(), |col| {
+                        col.child(label("No unfinished video jobs in this workspace."))
+                    })
+                    .children(
+                        self.pending_jobs
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .map(|(index, job)| {
+                                div()
+                                    .id(("job", index))
+                                    .p_3()
+                                    .border_1()
+                                    .border_color(rgb(0x30384a))
+                                    .rounded_lg()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(label(&format!(
+                                        "{} · {}",
+                                        job.request.project, job.request.model
+                                    )))
+                                    .child(shorten(&job.request.prompt, 180))
+                                    .child(
+                                        Button::new("resume-job")
+                                            .primary()
+                                            .label("Resume")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.resume_job(job.clone(), cx)
+                                            })),
+                                    )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
     fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let projects = self.book.projects.clone();
         div()
@@ -889,129 +1284,56 @@ impl Studio {
                 div().p_4().border_t_1().border_color(rgb(0x292e3d)).child(
                     Button::new("settings")
                         .label("Settings")
-                        .disabled(self.busy)
+                        .disabled(self.busy || self.pulling.is_some() || self.reference_loading)
                         .on_click(cx.listener(Self::open_settings)),
                 ),
             )
             .into_any_element()
     }
     fn composer(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex_shrink_0()
-            .p_5()
-            .border_t_1()
-            .border_color(rgb(0x292e3d))
-            .bg(rgb(0x171c27))
-            .flex()
-            .gap_5()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .child(label("PROMPT"))
-                            .child(
-                                Button::new("new-prompt")
-                                    .label("New prompt")
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.selected_prompt = None;
-                                        this.prompt.update(cx, |i, cx| i.set_value("", window, cx));
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        Input::new(&self.prompt)
-                            .h(px(235.))
-                            .disabled(self.busy || self.selected_project.is_none()),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(260.))
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(label("OUTPUT"))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("images")
-                                    .label("Image")
-                                    .when(self.kind == MediaKind::Image, |b| b.primary())
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.set_kind(MediaKind::Image, w, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("videos")
-                                    .label("Video")
-                                    .when(self.kind == MediaKind::Video, |b| b.primary())
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.set_kind(MediaKind::Video, w, cx)
-                                    })),
-                            ),
-                    )
-                    .child(label("Model"))
-                    .child(Select::new(&self.model).disabled(self.busy))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(label("Size"))
-                                    .child(Select::new(&self.size).disabled(self.busy)),
-                            )
-                            .when(self.kind == MediaKind::Video, |row| {
-                                row.child(
-                                    div()
-                                        .w(px(80.))
-                                        .child(label("Seconds"))
-                                        .child(Select::new(&self.seconds).disabled(self.busy)),
-                                )
-                            }),
-                    )
-                    .child(
-                        Button::new("generate")
-                            .primary()
-                            .label(if self.kind == MediaKind::Image {
-                                "Generate image"
-                            } else {
-                                "Generate video"
-                            })
-                            .loading(self.busy)
-                            .disabled(self.busy || self.selected_project.is_none())
-                            .on_click(cx.listener(Self::generate)),
-                    )
-                    .when(self.kind == MediaKind::Video, |col| {
-                        col.child(
-                            Button::new("resume")
-                                .label("Resume saved video…")
-                                .disabled(self.busy)
-                                .on_click(cx.listener(Self::resume)),
-                        )
-                    })
-                    .when(self.busy && self.running_video, |col| {
-                        col.child(Button::new("stop").label("Stop waiting").on_click(
-                            cx.listener(|this, _, _, _| this.cancel.store(true, Ordering::Relaxed)),
-                        ))
-                    }),
-            )
+        let locked = self.busy || self.pulling.is_some() || self.reference_loading;
+        let ollama = self.active_provider() == Provider::Ollama;
+        let editing = self.input_image.is_some();
+        let source = self
+            .model
+            .read(cx)
+            .selected_value()
+            .and_then(|id| self.models.iter().find(|m| &m.id == id))
+            .and_then(|m| m.source.clone());
+        div().flex_shrink_0().p_5().border_t_1().border_color(rgb(0x292e3d)).bg(rgb(0x171c27)).flex().gap_5()
+            .child(div().flex_1().min_w_0().flex().flex_col().gap_2()
+                .child(div().flex().justify_between().items_center().gap_2()
+                    .child(label(if editing { "EDIT PROMPT" } else { "PROMPT" }))
+                    .child(Button::new("upload-image").label("Upload image…").disabled(locked || ollama).on_click(cx.listener(Self::upload_reference)))
+                    .child(Button::new("new-prompt").label("New prompt").disabled(locked).on_click(cx.listener(|this, _, w, cx| {
+                        this.selected_prompt = None; this.clear_reference(w,cx); this.prompt.update(cx, |i,cx| i.set_value("",w,cx)); cx.notify();
+                    }))))
+                .when_some(self.input_image.as_ref(), |col, path| col.child(div().flex().items_center().gap_3()
+                    .child(img(path.clone()).w(px(72.)).h(px(64.)).object_fit(ObjectFit::Contain))
+                    .child(label("Reference image · describe the changes below"))
+                    .child(Button::new("clear-reference").label("Remove ×").disabled(locked).on_click(cx.listener(|this, _, w, cx| this.clear_reference(w,cx))))))
+                .child(Input::new(&self.prompt).h(px(if editing { 170. } else { 235. })).disabled(locked || self.selected_project.is_none())))
+            .child(div().w(px(285.)).flex_shrink_0().flex().flex_col().gap_2()
+                .child(label(&format!("OUTPUT · {}", self.active_provider().label())))
+                .child(div().flex().gap_2()
+                    .child(Button::new("images").label("Image").when(self.kind == MediaKind::Image, |b| b.primary()).disabled(locked)
+                        .on_click(cx.listener(|this, _, w, cx| this.set_kind(MediaKind::Image,w,cx))))
+                    .child(Button::new("videos").label("Video").when(self.kind == MediaKind::Video, |b| b.primary()).disabled(locked || ollama)
+                        .on_click(cx.listener(|this, _, w, cx| this.set_kind(MediaKind::Video,w,cx)))))
+                .child(label("Model")).child(Select::new(&self.model).disabled(locked))
+                .when(ollama, |col| col.child(div().text_xs().text_color(rgb(0xf0cf91)).child("Missing models download automatically. Experimental image generation requires a compatible Ollama server; editing/video use LiteLLM.")))
+                .when_some(source, |col, source| col.child(Button::new("model-source").label("Model details & license").on_click(move |_, _, cx| cx.open_url(&source))))
+                .child(div().flex().gap_2()
+                    .child(div().flex_1().child(label("Size")).child(Select::new(&self.size).disabled(locked)))
+                    .when(self.kind == MediaKind::Video, |row| row.child(div().w(px(80.)).child(label("Seconds")).child(Select::new(&self.seconds).disabled(locked)))))
+                .child(Button::new("generate").primary().label(if editing { "Edit image" } else if self.kind == MediaKind::Image { "Generate image" } else { "Generate video" })
+                    .loading(self.busy).disabled(locked || self.selected_project.is_none() || (ollama && editing)).on_click(cx.listener(Self::generate)))
+                .when(self.pulling.is_some(), |col| col.child(Button::new("stop-download").label("Stop waiting for download").on_click(cx.listener(|this, _, _, cx| {
+                        this.pull_cancel.store(true,Ordering::Relaxed); this.pull_epoch += 1; this.pulling = None;
+                        this.status = "Stopped waiting for download. Ollama may continue; selecting the model again checks/resumes it.".into(); cx.notify();
+                    }))))
+                .when(self.kind == MediaKind::Video && !ollama, |col| col.child(Button::new("resume").label("Resume saved video…").disabled(locked).on_click(cx.listener(Self::resume))))
+                .when(self.busy && (self.running_video || ollama), |col| col.child(Button::new("stop").label("Stop waiting").on_click(cx.listener(|this, _, _, _| this.cancel.store(true,Ordering::Relaxed))))))
             .into_any_element()
     }
     fn card(&self, asset: &Asset, cx: &mut Context<Self>) -> AnyElement {
@@ -1019,6 +1341,7 @@ impl Studio {
         let copy = asset.path.clone();
         let preview = asset.clone();
         let video = asset.path.clone();
+        let edit = asset.path.clone();
         div()
             .id(SharedString::from(asset.id.to_string()))
             .group("asset")
@@ -1085,6 +1408,14 @@ impl Studio {
                     .group_hover("asset", |s| s.opacity(1.))
                     .when(asset.kind == MediaKind::Image, |row| {
                         row.child(
+                            Button::new("edit")
+                                .label("Edit")
+                                .disabled(self.busy || self.active_provider() == Provider::Ollama)
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    this.begin_edit(edit.clone(), w, cx)
+                                })),
+                        )
+                        .child(
                             Button::new("copy").label("Copy image").on_click(
                                 cx.listener(move |this, _, _, _| this.copy(copy.clone())),
                             ),
@@ -1165,12 +1496,9 @@ impl Studio {
                         cx.notify();
                     })),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x99a5bc))
-                    .child("JSON metadata and video jobs are kept separately in _studio."),
-            )
+            .child(div().text_xs().text_color(rgb(0x99a5bc)).child(
+                "Projects, history, outputs and video jobs are indexed in _studio/studio.sqlite3.",
+            ))
             .into_any_element()
     }
     fn settings_modal(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1211,10 +1539,7 @@ impl Studio {
                                 cx.listener(|this, _, w, cx| this.close_settings(w, cx)),
                             )),
                     )
-                    .child(label("Gateway URL"))
-                    .child(Input::new(&self.url).disabled(self.connecting))
-                    .child(label("API key"))
-                    .child(Input::new(&self.key).disabled(self.connecting))
+                    .child(self.connection_fields(cx))
                     .child(self.folder_fields(cx))
                     .when(self.error, |col| {
                         col.child(
@@ -1249,6 +1574,7 @@ impl Studio {
     fn image_viewer(&self, asset: &Asset, cx: &mut Context<Self>) -> AnyElement {
         let copy = asset.path.clone();
         let reveal = asset.path.clone();
+        let edit = asset.path.clone();
         div()
             .absolute()
             .inset_0()
@@ -1269,6 +1595,14 @@ impl Studio {
                             .min_w_0()
                             .text_lg()
                             .child(asset.project.clone()),
+                    )
+                    .child(
+                        Button::new("viewer-edit")
+                            .label("Edit image")
+                            .disabled(self.busy || self.active_provider() == Provider::Ollama)
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.begin_edit(edit.clone(), w, cx)
+                            })),
                     )
                     .child(
                         Button::new("viewer-copy")
@@ -1307,6 +1641,15 @@ impl Studio {
             .child(label(&asset.model))
             .into_any_element()
     }
+}
+
+fn provider_key(provider: Provider) -> String {
+    std::env::var(if provider == Provider::Ollama {
+        "OLLAMA_API_KEY"
+    } else {
+        "LITELLM_API_KEY"
+    })
+    .unwrap_or_default()
 }
 
 fn image_sizes() -> Vec<String> {
@@ -1384,88 +1727,81 @@ impl Render for Studio {
                 Page::Output => "02 / Output",
                 Page::Studio => "Studio",
             }));
-        let body =
-            match self.page {
-                Page::Gateway => div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w(px(550.))
-                            .p_8()
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .bg(rgb(0x1b2130))
-                            .rounded_xl()
-                            .child(
-                                div()
-                                    .text_3xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("A home for your imagination."),
-                            )
-                            .child(label(
-                                "Connect to LiteLLM to discover your available models.",
-                            ))
-                            .child(label("Gateway URL"))
-                            .child(Input::new(&self.url).disabled(self.connecting))
-                            .child(label("API key"))
-                            .child(Input::new(&self.key).disabled(self.connecting))
-                            .child(div().text_xs().text_color(rgb(0x99a5bc)).child(
-                                "Your key stays in memory. You can also set LITELLM_API_KEY.",
-                            ))
-                            .child(
-                                Button::new("connect")
-                                    .primary()
-                                    .label("Connect & discover models")
-                                    .loading(self.connecting)
-                                    .disabled(self.connecting)
-                                    .on_click(cx.listener(Self::connect)),
-                            ),
-                    )
-                    .into_any_element(),
-                Page::Output => div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w(px(610.))
-                            .p_6()
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("Make room for your ideas."),
-                            )
-                            .child(self.folder_fields(cx))
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_between()
-                                    .child(Button::new("back").label("Back").on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.page = Page::Gateway;
-                                            cx.notify();
-                                        },
-                                    )))
-                                    .child(
-                                        Button::new("open-studio")
-                                            .primary()
-                                            .label("Open studio")
-                                            .on_click(cx.listener(Self::enter_studio)),
-                                    ),
-                            ),
-                    )
-                    .into_any_element(),
-                Page::Studio => self.workspace(cx),
-            };
+        let body = match self.page {
+            Page::Gateway => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(550.))
+                        .p_8()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .bg(rgb(0x1b2130))
+                        .rounded_xl()
+                        .child(
+                            div()
+                                .text_3xl()
+                                .font_weight(FontWeight::BOLD)
+                                .child("A home for your imagination."),
+                        )
+                        .child(label(
+                            "Connect to LiteLLM to discover your available models.",
+                        ))
+                        .child(self.connection_fields(cx))
+                        .child(
+                            Button::new("connect")
+                                .primary()
+                                .label("Connect & discover models")
+                                .loading(self.connecting)
+                                .disabled(self.connecting)
+                                .on_click(cx.listener(Self::connect)),
+                        ),
+                )
+                .into_any_element(),
+            Page::Output => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(610.))
+                        .p_6()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(FontWeight::BOLD)
+                                .child("Make room for your ideas."),
+                        )
+                        .child(self.folder_fields(cx))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .child(Button::new("back").label("Back").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.page = Page::Gateway;
+                                        cx.notify();
+                                    },
+                                )))
+                                .child(
+                                    Button::new("open-studio")
+                                        .primary()
+                                        .label("Open studio")
+                                        .on_click(cx.listener(Self::enter_studio)),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+            Page::Studio => self.workspace(cx),
+        };
         div()
             .relative()
             .size_full()
@@ -1477,6 +1813,10 @@ impl Render for Studio {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     if this.viewer.take().is_some() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    } else if this.jobs_open {
+                        this.jobs_open = false;
                         cx.stop_propagation();
                         cx.notify();
                     } else if this.settings_open {
@@ -1505,6 +1845,7 @@ impl Render for Studio {
             .when(self.settings_open, |root| {
                 root.child(self.settings_modal(cx))
             })
+            .when(self.jobs_open, |root| root.child(self.jobs_modal(cx)))
             .when_some(self.viewer.as_ref(), |root, asset| {
                 root.child(self.image_viewer(asset, cx))
             })

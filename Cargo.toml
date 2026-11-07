@@ -1,6 +1,6 @@
 [package]
 name = "rustlilm-studio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A native image and video studio for LiteLLM gateways"
 license = "MIT"
@@ -24,6 +24,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+sha2 = "0.10"
+keyring = { version = "=3.6.3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 gpui = { version = "=0.2.2", optional = true }
 gpui-component = { version = "=0.4.0", optional = true }

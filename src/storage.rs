@@ -8,10 +8,29 @@ use std::{
 };
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Provider {
+    #[default]
+    LiteLlm,
+    Ollama,
+}
+
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LiteLlm => "LiteLLM",
+            Self::Ollama => "Ollama",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub provider: Provider,
+    pub remember_key: bool,
     pub gateway_url: String,
+    pub ollama_url: String,
     pub output: PathBuf,
     pub project_folders: bool,
     pub date_folders: bool,
@@ -20,7 +39,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            provider: Provider::LiteLlm,
+            remember_key: true,
             gateway_url: "http://localhost:4000".into(),
+            ollama_url: "http://localhost:11434".into(),
             output: directories::UserDirs::new()
                 .and_then(|d| d.picture_dir().map(Path::to_path_buf))
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -29,6 +51,24 @@ impl Default for Settings {
             date_folders: true,
         }
     }
+}
+
+pub fn prepare_reference(source: &Path, logs: &Path) -> Result<PathBuf> {
+    if fs::metadata(source)?.len() > 100 * 1024 * 1024 {
+        bail!("Choose an image smaller than 100 MiB");
+    }
+    let mut reader = image::ImageReader::open(source)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
+        .decode()
+        .context("Cannot decode the selected image")?;
+    let dir = logs.join("inputs");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.png", Uuid::new_v4()));
+    image.save_with_format(&path, image::ImageFormat::Png)?;
+    Ok(path)
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -41,19 +81,31 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 impl Settings {
-    pub fn load() -> Result<Self> {
-        let path = config_dir()?.join("settings.json");
-        if !path.exists() {
-            return Ok(Self::default());
+    pub fn endpoint_url(&self) -> &str {
+        match self.provider {
+            Provider::LiteLlm => &self.gateway_url,
+            Provider::Ollama => &self.ollama_url,
         }
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+    pub fn load() -> Result<Self> {
+        let dir = config_dir()?;
+        let database = crate::database::Database::open(&dir.join("settings.sqlite3"))?;
+        if let Some(settings) = database.settings()? {
+            return Ok(settings);
+        }
+        let legacy = dir.join("settings.json");
+        if legacy.exists() {
+            let settings: Self = serde_json::from_slice(&fs::read(&legacy)?)?;
+            database.save_settings(&settings)?;
+            fs::remove_file(legacy)?;
+            return Ok(settings);
+        }
+        Ok(Self::default())
     }
 
     pub fn save(&self) -> Result<()> {
-        let dir = config_dir()?;
-        fs::create_dir_all(&dir)?;
-        fs::write(dir.join("settings.json"), serde_json::to_vec_pretty(self)?)?;
-        Ok(())
+        crate::database::Database::open(&config_dir()?.join("settings.sqlite3"))?
+            .save_settings(self)
     }
 
     pub fn destination(&self, project: &str) -> Result<PathBuf> {
@@ -131,44 +183,6 @@ pub fn metadata_dir(root: &Path) -> PathBuf {
     root.join("_studio")
 }
 
-pub fn write_json(path: &Path, value: &(impl Serialize + ?Sized)) -> Result<()> {
-    fs::create_dir_all(
-        path.parent()
-            .context("Metadata file has no parent folder")?,
-    )?;
-    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    drop(file);
-    #[cfg(target_os = "windows")]
-    {
-        // Keep a recoverable backup while replacing a file on Windows.
-        let backup = path.with_extension("json.bak");
-        if path.exists() {
-            if backup.exists() {
-                fs::remove_file(&backup)?;
-            }
-            fs::rename(path, &backup)?;
-        }
-        if let Err(error) = fs::rename(&temp, path) {
-            if backup.exists() {
-                let _ = fs::rename(&backup, path);
-            }
-            return Err(error.into());
-        }
-        if backup.exists() {
-            fs::remove_file(backup)?;
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    fs::rename(temp, path)?;
-    Ok(())
-}
-
 pub fn save_asset(
     dir: &Path,
     logs: &Path,
@@ -198,61 +212,105 @@ pub fn save_asset(
         prompt_id: details.prompt_id,
         created: Utc::now(),
     };
-    write_json(&logs.join("assets").join(format!("{id}.json")), &asset)?;
+    crate::database::Database::workspace(logs)?.save_assets(std::slice::from_ref(&asset))?;
     Ok(asset)
 }
 
 pub fn load_gallery(root: &Path) -> Result<Vec<Asset>> {
     migrate_legacy(root)?;
-    let path = metadata_dir(root).join("gallery.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let assets: Vec<Asset> = serde_json::from_slice(&fs::read(path)?)?;
-    Ok(assets.into_iter().filter(|a| a.path.is_file()).collect())
+    Ok(crate::database::Database::workspace(&metadata_dir(root))?
+        .assets()?
+        .into_iter()
+        .filter(|a| a.path.is_file())
+        .collect())
 }
 
 pub fn save_gallery(root: &Path, assets: &[Asset]) -> Result<()> {
-    write_json(&metadata_dir(root).join("gallery.json"), &assets)
+    crate::database::Database::workspace(&metadata_dir(root))?.save_assets(assets)
 }
 
-/// Move only metadata recognized as ours. Unrelated JSON files are never touched.
+/// Import v0.1/v0.2 JSON metadata before removing recognized legacy files.
+/// Imports are idempotent; files remain recoverable if the process is interrupted.
 pub fn migrate_legacy(root: &Path) -> Result<()> {
     let logs = metadata_dir(root);
-    if logs.join("migration-v1.done").exists() {
+    let mut db = crate::database::Database::workspace(&logs)?;
+    if db.migrated()? {
         return Ok(());
     }
-    fs::create_dir_all(&logs)?;
-    let old_index = root.join(".rustlilm-gallery.json");
-    if old_index.exists() {
-        let assets: Vec<Asset> = serde_json::from_slice(&fs::read(&old_index)?)
-            .context("Cannot migrate the previous gallery index")?;
-        for asset in &assets {
-            let sidecar = asset.path.with_extension("json");
-            if sidecar.exists() {
-                if let Ok(old) = serde_json::from_slice::<Asset>(&fs::read(&sidecar)?) {
-                    if old.id == asset.id {
-                        write_json(
-                            &logs.join("assets").join(format!("{}.json", asset.id)),
-                            &old,
-                        )?;
-                        fs::remove_file(sidecar)?;
-                    }
+    let mut cleanup = Vec::new();
+    let mut assets = db.assets()?;
+    for path in [
+        root.join(".rustlilm-gallery.json"),
+        logs.join("gallery.json"),
+    ] {
+        if path.exists() {
+            let old: Vec<Asset> = serde_json::from_slice(&fs::read(&path)?)
+                .context("Cannot import the previous gallery index")?;
+            assets.extend(old);
+            cleanup.push(path);
+        }
+    }
+    for path in json_files(&logs.join("assets"))? {
+        let asset: Asset = serde_json::from_slice(&fs::read(&path)?)?;
+        assets.push(asset);
+        cleanup.push(path);
+    }
+    for asset in &assets {
+        let path = asset.path.with_extension("json");
+        if path.exists() {
+            if let Ok(old) = serde_json::from_slice::<Asset>(&fs::read(&path)?) {
+                if old.id == asset.id {
+                    cleanup.push(path);
                 }
             }
         }
-        let new_index = logs.join("gallery.json");
-        if !new_index.exists() {
-            write_json(&new_index, &assets)?;
-        }
-        fs::remove_file(old_index)?;
     }
-    migrate_jobs(root, &logs)?;
-    fs::write(logs.join("migration-v1.done"), b"1")?;
+    db.save_assets(&assets)?;
+    let projects = logs.join("projects.json");
+    if projects.exists() {
+        let book: crate::projects::ProjectBook = serde_json::from_slice(&fs::read(&projects)?)?;
+        db.save_projects(&book)?;
+        cleanup.push(projects);
+    }
+    let mut jobs = json_files(&logs.join("jobs"))?;
+    find_legacy_jobs(root, &logs, &mut jobs)?;
+    for path in jobs {
+        // A generically named unrelated JSON file is not an application checkpoint.
+        if let Ok(mut pending) =
+            serde_json::from_slice::<crate::gateway::PendingVideo>(&fs::read(&path)?)
+        {
+            pending.request.logs = logs.clone();
+            db.save_job(&pending)?;
+            cleanup.push(path);
+        }
+    }
+    cleanup.sort();
+    cleanup.dedup();
+    for path in cleanup {
+        fs::remove_file(path)?;
+    }
+    let marker = logs.join("migration-v1.done");
+    if marker.exists() {
+        fs::remove_file(marker)?;
+    }
+    db.finish_migration()?;
     Ok(())
 }
 
-fn migrate_jobs(dir: &Path, logs: &Path) -> Result<()> {
+fn json_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|s| s == "json") {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+fn find_legacy_jobs(dir: &Path, logs: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
@@ -261,17 +319,9 @@ fn migrate_jobs(dir: &Path, logs: &Path) -> Result<()> {
         let path = entry.path();
         let kind = entry.file_type()?;
         if kind.is_dir() && path != logs {
-            migrate_jobs(&path, logs)?;
+            find_legacy_jobs(&path, logs, paths)?;
         } else if kind.is_file() && entry.file_name() == "pending-video.json" {
-            if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&fs::read(&path)?) {
-                if value["id"].is_string() && value.pointer("/request/destination").is_some() {
-                    let checkpoint = logs.join("jobs").join(format!("{}.json", Uuid::new_v4()));
-                    value["request"]["logs"] = serde_json::to_value(logs)?;
-                    value["checkpoint"] = serde_json::to_value(&checkpoint)?;
-                    write_json(&checkpoint, &value)?;
-                    fs::remove_file(path)?;
-                }
-            }
+            paths.push(path);
         }
     }
     Ok(())

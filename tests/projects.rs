@@ -18,6 +18,8 @@ fn entry(text: &str) -> PromptEntry {
         state: PromptState::Submitted,
         detail: None,
         imported: false,
+        provider: storage::Provider::LiteLlm,
+        input_image: None,
     }
 }
 
@@ -57,7 +59,7 @@ fn projects_and_prompt_history_survive_restart_without_outputs() {
     assert_eq!(prompt.state, PromptState::Failed);
     assert_eq!(prompt.detail.as_deref(), Some("Gateway unavailable"));
     assert!(storage::metadata_dir(root.path())
-        .join("projects.json")
+        .join("studio.sqlite3")
         .exists());
 }
 
@@ -112,8 +114,7 @@ fn legacy_gallery_and_sidecars_move_without_moving_images_or_unrelated_json() {
     assert!(!asset.path.with_extension("json").exists());
     assert!(!root.path().join(".rustlilm-gallery.json").exists());
     assert!(storage::metadata_dir(root.path())
-        .join("assets")
-        .join(format!("{}.json", asset.id))
+        .join("studio.sqlite3")
         .exists());
     assert_eq!(storage::load_gallery(root.path()).unwrap().len(), 1);
     let book = ProjectBook::load(root.path(), &gallery).unwrap();
@@ -135,16 +136,15 @@ fn legacy_video_checkpoint_moves_to_shared_jobs_folder() {
     fs::write(&old, serde_json::to_vec(&request).unwrap()).unwrap();
     storage::migrate_legacy(root.path()).unwrap();
     assert!(!old.exists());
-    let jobs = storage::metadata_dir(root.path()).join("jobs");
-    let path = fs::read_dir(&jobs).unwrap().next().unwrap().unwrap().path();
-    let pending: rustlilm_studio::gateway::PendingVideo =
-        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(pending.checkpoint, path);
+    let db = rustlilm_studio::database::Database::workspace(&storage::metadata_dir(root.path()))
+        .unwrap();
+    let jobs = db.jobs().unwrap();
+    let pending = &jobs[0];
     assert_eq!(pending.request.destination, folder);
     assert_eq!(pending.request.logs, storage::metadata_dir(root.path()));
     assert_eq!(pending.id, "opaque/video-id");
     storage::migrate_legacy(root.path()).unwrap();
-    assert_eq!(fs::read_dir(jobs).unwrap().count(), 1);
+    assert_eq!(db.jobs().unwrap().len(), 1);
 }
 
 #[test]

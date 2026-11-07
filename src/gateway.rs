@@ -1,4 +1,4 @@
-use crate::storage::{save_asset, Asset, MediaKind};
+use crate::storage::{save_asset, write_json, Asset, AssetDetails, MediaKind};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{
@@ -17,6 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -55,12 +56,18 @@ pub struct Generation {
     pub size: String,
     pub seconds: u32,
     pub destination: PathBuf,
+    #[serde(default)]
+    pub logs: PathBuf,
+    #[serde(default)]
+    pub prompt_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingVideo {
     pub id: String,
     pub request: Generation,
+    #[serde(default)]
+    pub checkpoint: PathBuf,
 }
 
 impl Gateway {
@@ -210,12 +217,16 @@ impl Gateway {
             };
             assets.push(save_asset(
                 &request.destination,
+                &request.logs,
                 &bytes,
                 extension,
-                MediaKind::Image,
-                &request.model,
-                &request.prompt,
-                &request.project,
+                AssetDetails {
+                    kind: MediaKind::Image,
+                    model: &request.model,
+                    prompt: &request.prompt,
+                    project: &request.project,
+                    prompt_id: request.prompt_id,
+                },
             )?);
         }
         Ok(assets)
@@ -255,12 +266,13 @@ impl Gateway {
                 .context("Video response has no job ID")?
                 .into(),
             request: request.clone(),
+            checkpoint: request.logs.join("jobs").join(format!(
+                "{}.json",
+                request.prompt_id.unwrap_or_else(Uuid::new_v4)
+            )),
         };
         // Keep the job ID before polling. A timeout or restart must not submit (and bill) it again.
-        std::fs::write(
-            request.destination.join("pending-video.json"),
-            serde_json::to_vec_pretty(&pending)?,
-        )?;
+        write_json(&pending.checkpoint, &pending)?;
         Ok(pending)
     }
 
@@ -306,14 +318,18 @@ impl Gateway {
                     let r = &pending.request;
                     let asset = save_asset(
                         &r.destination,
+                        &r.logs,
                         &bytes,
                         "mp4",
-                        MediaKind::Video,
-                        &r.model,
-                        &r.prompt,
-                        &r.project,
+                        AssetDetails {
+                            kind: MediaKind::Video,
+                            model: &r.model,
+                            prompt: &r.prompt,
+                            project: &r.project,
+                            prompt_id: r.prompt_id,
+                        },
                     )?;
-                    let _ = std::fs::remove_file(r.destination.join("pending-video.json"));
+                    let _ = std::fs::remove_file(&pending.checkpoint);
                     return Ok(asset);
                 }
                 "failed" | "cancelled" | "canceled" => {

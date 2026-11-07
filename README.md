@@ -4,23 +4,33 @@ A native desktop image and video generation app written in **Rust + GPUI**, usin
 
 ## Getting started
 
-1. Open the app and enter your gateway URL, with or without `/v1` (for example `http://localhost:4000`). Enter an API key if your gateway requires one, or set `LITELLM_API_KEY` before launching.
-2. Connect to discover available models. Choose a model and an output directory.
-3. Enable **Create a folder for each project** and/or **Group creations by date** if desired.
-4. Open the studio, choose Images or Videos, select a model and size, and write your prompt.
-5. Hover over an image for **Copy image** and **Show in folder**. Videos offer **Play** and **Show in folder**.
+1. Enter your LiteLLM gateway URL and API key (or set `LITELLM_API_KEY`) and connect.
+2. Choose an output folder and optional project/date grouping.
+3. Create or select a project in the **left sidebar**. The sidebar shows the project count; expand a project to see its submitted prompt history.
+4. Write your prompt in the **bottom composer**. On its right, choose Image or Video, model, size, optional video duration, and Generate.
+5. Click an image to open the **in-app viewer**. Copy it from the card or viewer; an **Image copied** toast appears at the top right. Close the viewer with its Close button or Escape.
+6. Open **Settings** from the sidebar whenever you need it. **Save settings** applies changes. **Close**, **Cancel**, or **Escape** returns to the studio and discards unsaved edits, including an in-flight connection check.
 
-API keys remain in memory and are never written to settings, gallery metadata, or the repository. Settings remember your gateway URL and output preferences. Use HTTPS for a remote gateway.
+API keys stay in memory and are never written to settings or history. Settings remember your gateway URL and output preferences. Use HTTPS for a remote gateway.
 
-## Features
+## Projects and prompt history
 
-- `/v1/models` discovery with optional `/model/info` capability metadata. Gateways that restrict `/model/info` still work. Aliases without capability metadata are available in both image and video mode; choose the appropriate alias yourself.
-- Switch models for each generation. Image size presets and video duration/size controls.
-- Images from either `b64_json` or downloadable URLs; PNG, JPEG, WebP, and GIF outputs retain their original format.
-- Asynchronous video submission, progress polling, and saved job recovery. **Stop waiting** stops local polling; it does not cancel the remote job. **Resume video** opens the saved `pending-video.json` file and polls the same job without submitting again.
-- Persistent local gallery, unique filenames, and a JSON sidecar with model, prompt, project, and timestamp for every output.
-- Output layout: `chosen-folder/project/YYYY-MM-DD/time-uuid.png` (project/date parts are independently optional).
-- Native folder picker and operating system clipboard/file manager integration.
+Projects are created and selected entirely in the left pane. Each accordion lists the prompts submitted in that project, with their time and result status. Select a prompt to restore its text, output type, model, size, and duration and view its generated outputs. Editing and generating again creates a new history entry. Failed requests remain in history too. Unsubmitted drafts are retained in memory when switching between projects.
+
+The right pane contains the selected project's gallery and the bottom composer. Images open inside the app; videos open in your operating system's default player. Hover actions still provide **Copy image** and **Show in folder**.
+
+## Output and metadata folders
+
+Generated media follows the optional layout `chosen-folder/project/YYYY-MM-DD/time-uuid.png`. Project and date folders are independently optional. **Project folders contain media only.** All app JSON data is stored separately under the output folder:
+
+| Path | Contents |
+| --- | --- |
+| `_studio/gallery.json` | Local output index |
+| `_studio/projects.json` | Projects, prompt history, and generation settings |
+| `_studio/assets/<id>.json` | Metadata for each generated image/video |
+| `_studio/jobs/<id>.json` | Video jobs available for resuming |
+
+On first use after upgrading from v0.1, the app migrates its old gallery index, recognized JSON sidecars, and pending-video checkpoints into `_studio`, while keeping the actual images/videos in place. Unrelated JSON files are left alone. Projects and prompt history are reconstructed from the old gallery. Historical sizes/durations unavailable in v0.1 metadata use the original defaults when restoring a legacy prompt.
 
 ## LiteLLM requirements
 
@@ -37,7 +47,7 @@ The gateway must expose the endpoints used by the selected models:
 
 Model aliases, supported sizes, durations, and billing are controlled by your gateway/provider. Configure actual image/video generation deployments in LiteLLM; chat-only deployments cannot generate media through these endpoints. The UI exposes common size/duration presets, which may not be supported by every model. Video outputs must be MP4. Videos open in your default player rather than playing inside the gallery.
 
-If a video times out or the app closes, find `pending-video.json` in the project's output folder and use **Resume video** with the same gateway. A pending job blocks another video submission into that project/date folder to avoid accidental double billing. For a permanently failed job, remove its JSON checkpoint manually before retrying. A stopped or timed-out image request may also still complete remotely; check your gateway before retrying.
+If a video times out or the app closes, use **Resume saved video** and select its checkpoint from `_studio/jobs`. Resuming polls the existing job without submitting it again. **Stop waiting** stops local polling and does not cancel the remote job. A stopped or timed-out image request may also still complete remotely; check your gateway before retrying.
 
 ## Build from source
 
@@ -80,8 +90,10 @@ The GitHub workflow runs tests, builds natively on Windows and Ubuntu, packages 
 
 - `src/main.rs`: GPUI interface and background task coordination.
 - `src/gateway.rs`: HTTP client, model discovery, image/video APIs, job checkpoints.
-- `src/storage.rs`: settings, safe output paths, metadata, local gallery.
+- `src/storage.rs`: settings, safe output paths, centralized metadata, and legacy migration.
+- `src/projects.rs`: persistent projects and prompt history.
 - `tests/gateway.rs`: local HTTP integration tests; no paid provider requests.
+- `tests/projects.rs`: project/history persistence, output association, and migration regression tests.
 
 ## Current scope
 

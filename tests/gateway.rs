@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rustlilm_studio::{
     gateway::{Gateway, Generation},
-    storage::{self, MediaKind, Settings},
+    storage::{self, AssetDetails, MediaKind, Settings},
 };
 use serde_json::json;
 use std::{
@@ -75,6 +75,8 @@ fn generation(dir: &std::path::Path) -> Generation {
         size: "1024x1024".into(),
         seconds: 4,
         destination: dir.into(),
+        logs: storage::metadata_dir(dir),
+        prompt_id: Some(uuid::Uuid::new_v4()),
     }
 }
 fn png() -> Vec<u8> {
@@ -171,7 +173,11 @@ fn base64_images_are_saved_with_metadata_and_gallery() {
         .images(&generation(dir.path()))
         .unwrap();
     assert_eq!(std::fs::read(&assets[0].path).unwrap(), bytes);
-    assert!(assets[0].path.with_extension("json").exists());
+    assert!(!assets[0].path.with_extension("json").exists());
+    assert!(storage::metadata_dir(dir.path())
+        .join("assets")
+        .join(format!("{}.json", assets[0].id))
+        .exists());
     storage::save_gallery(dir.path(), &assets).unwrap();
     assert_eq!(
         storage::load_gallery(dir.path()).unwrap()[0].prompt,
@@ -263,12 +269,15 @@ fn video_submission_checkpoint_polling_and_download() {
     let mut request = generation(dir.path());
     request.kind = MediaKind::Video;
     let pending = gateway.submit_video(&request).unwrap();
-    assert!(dir.path().join("pending-video.json").exists());
+    assert!(pending.checkpoint.exists());
+    assert!(pending
+        .checkpoint
+        .starts_with(storage::metadata_dir(dir.path()).join("jobs")));
     let asset = gateway
         .poll_video(&pending, Arc::new(AtomicBool::new(false)), |_| {})
         .unwrap();
     assert_eq!(std::fs::read(asset.path).unwrap(), video);
-    assert!(!dir.path().join("pending-video.json").exists());
+    assert!(!pending.checkpoint.exists());
     server.join().unwrap();
 }
 #[test]
@@ -280,7 +289,10 @@ fn cancelled_polling_preserves_checkpoint() {
     assert!(gateway
         .poll_video(&pending, Arc::new(AtomicBool::new(true)), |_| {})
         .is_err());
-    assert!(dir.path().join("pending-video.json").exists());
+    assert!(pending.checkpoint.exists());
+    assert!(pending
+        .checkpoint
+        .starts_with(storage::metadata_dir(dir.path()).join("jobs")));
     server.join().unwrap();
 }
 #[test]
@@ -307,22 +319,30 @@ fn output_grouping_and_unique_names() {
     assert_eq!(settings.destination("ignored").unwrap(), dir.path());
     let first = storage::save_asset(
         dir.path(),
+        &storage::metadata_dir(dir.path()),
         &png(),
         "png",
-        MediaKind::Image,
-        "model",
-        "prompt",
-        "project",
+        AssetDetails {
+            kind: MediaKind::Image,
+            model: "model",
+            prompt: "prompt",
+            project: "project",
+            prompt_id: None,
+        },
     )
     .unwrap();
     let second = storage::save_asset(
         dir.path(),
+        &storage::metadata_dir(dir.path()),
         &png(),
         "png",
-        MediaKind::Image,
-        "model",
-        "prompt",
-        "project",
+        AssetDetails {
+            kind: MediaKind::Image,
+            model: "model",
+            prompt: "prompt",
+            project: "project",
+            prompt_id: None,
+        },
     )
     .unwrap();
     assert_ne!(first.path, second.path);
